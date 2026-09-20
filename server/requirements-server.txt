@@ -1,0 +1,22 @@
+# seed-vc runtime deps, MINUS torch/torchvision/torchaudio.
+# The base image already ships torch 2.8.0+cu128 built for CUDA 12.8.
+# seed-vc's own requirements.txt both pins torch==2.4.0 and requests a
+# cu126 nightly, which would clobber that and break CUDA.
+#
+# numpy is pinned: 2.x breaks packages compiled against 1.x (numba, librosa).
+numpy==1.26.4
+scipy
+librosa
+soundfile
+huggingface-hub
+transformers
+munch
+einops
+descript-audio-codec
+resemblyzer
+modelscope
+funasr
+hydra-core
+pyyaml
+python-dotenv
+websockets>=13.1

@@ -1,0 +1,11 @@
+# Stage 1
+sounddevice==0.5.1
+numpy>=1.26
+python-dotenv==1.0.1
+
+# Stage 2 (uncomment once a provider is chosen)
+# python-socketio[client]==5.11.4   # Resemble Live STS
+# websockets==13.1                  # generic websocket clients
+
+# Stage 2 - ElevenLabs backend
+httpx==0.27.2

@@ -1,0 +1,16 @@
+# Secrets -- ELEVENLABS_API_KEY lives here. Never commit.
+.env
+
+# Audio: personal voice data, and large
+*.wav
+*.mp3
+*.aiff
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Runpod artifacts
+checkpoints/
