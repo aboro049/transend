@@ -208,12 +208,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prefill", type=int, default=settings.PREFILL_BLOCKS)
     p.add_argument("--queue", type=int, default=settings.QUEUE_MAX_BLOCKS)
     p.add_argument("--latency", default="low")
+    p.add_argument("--adapt-factor", type=float, default=1.5,
+                   help="Ceiling on adaptive growth, as a multiple of "
+                        "--prefill. Rounded up, minimum one step.")
     p.add_argument("--adaptive", action="store_true",
                    help="Adapt jitter buffer depth to conditions: grow on "
                         "overshoot, shrink during silence. --prefill becomes "
                         "the starting point, not a fixed target.")
     p.add_argument("--duration", type=float, default=0.0)
     p.add_argument("--record", default=None)
+    p.add_argument("--stats-json", default=None,
+                   help="Write the final run stats to this path as JSON, "
+                        "so a parent process can record them.")
     p.add_argument("--source-file", default=None,
                    help="Drive input from a WAV instead of the mic, paced in "
                         "real time and looped. Repeatable config comparisons.")
@@ -334,12 +340,14 @@ def main(argv: list[str] | None = None) -> int:
 
     virt_sink = pipe.fanout.add(OutputSink(
         "virtual", virt_idx, args.block, args.prefill, args.queue,
-        latency=_latency(args.latency), adaptive=args.adaptive))
+        latency=_latency(args.latency), adaptive=args.adaptive,
+        adapt_factor=args.adapt_factor))
     mon_sink = None
     if mon_idx is not None:
         mon_sink = pipe.fanout.add(OutputSink(
             "monitor", mon_idx, args.block, args.prefill, args.queue,
-            latency=_latency(args.latency), adaptive=args.adaptive))
+            latency=_latency(args.latency), adaptive=args.adaptive,
+        adapt_factor=args.adapt_factor))
 
     if args.backend == "seedvc":
         print(f"[VOICE] backend  : seedvc preset={args.preset} -> {converter.url}")
@@ -457,6 +465,50 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  input drops      : {pipe.in_dropped}")
     print(f"  input overflows  : {pipe.overflows}")
     print("=" * 62)
+
+    if args.stats_json:
+        # The summary above is for a human. This is the same run, in a shape
+        # the app can file into session history -- parsing the printed block
+        # would break the first time the layout changes.
+        try:
+            import json
+            stats = {
+                "ran_for_s": round(pipe.elapsed, 1),
+                "captured": pipe.captured,
+                "sent": converter.sent,
+                "received": converter.received,
+                "input_drops": pipe.in_dropped,
+                "input_overflows": pipe.overflows,
+                "input_hw_ms": round(in_ms, 1),
+                "capture_to_receive_ms": round(pipe.total_ms, 1),
+                "api_ms": round(pipe.api_ms, 1),
+                "backend": args.backend,
+                "preset": getattr(args, "preset", ""),
+                "block": args.block,
+                "adaptive": bool(getattr(args, "adaptive", False)),
+                "sinks": [],
+            }
+            for sk in pipe.fanout.sinks:
+                b = sk.buffer
+                stats["sinks"].append({
+                    "label": sk.label,
+                    "played": b.played,
+                    "underruns": b.underruns,
+                    "dropped": b.dropped,
+                    "trimmed_silent": b.trimmed_silent,
+                    "trimmed_audio": b.trimmed_audio,
+                    "target_ms": round(b.target_ms, 1),
+                    "peak_depth": b.peak_depth,
+                    "hw_ms": round(sk.latency_ms, 1),
+                })
+            v = pipe.fanout.sinks[0].buffer if pipe.fanout.sinks else None
+            stats["total_ms"] = round(
+                in_ms + pipe.total_ms + (v.target_ms if v else 0.0), 1)
+            with open(args.stats_json, "w", encoding="utf-8") as f:
+                json.dump(stats, f, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] could not write stats: {exc}", file=sys.stderr)
+
     return rc
 
 

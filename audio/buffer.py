@@ -55,6 +55,7 @@ class JitterBuffer:
         adapt_ceiling: int | None = None,
         shrink_after_s: float = 2.0,
         grow_sustain_s: float = 1.5,
+        adapt_factor: float = 1.5,
     ) -> None:
         self.block_frames = block_frames
         self.sample_rate = sample_rate
@@ -77,7 +78,9 @@ class JitterBuffer:
         # 2x the starting point so it cannot run away.
         self.adaptive = adaptive
         self.floor_blocks = max(1, min_blocks if min_blocks else 1)
-        self.ceiling_blocks = adapt_ceiling or max(2 * target_blocks, 3)
+        self.adapt_factor = adapt_factor
+        self.ceiling_blocks = adapt_ceiling or max(
+            math.ceil(adapt_factor * target_blocks), target_blocks + 1)
         self.shrink_after_s = shrink_after_s
         self.grow_sustain_s = grow_sustain_s
         self.initial_target = self.target_blocks

@@ -154,6 +154,22 @@ class Session:
         # Frames the client sends, at 48 kHz.
         self.client_block = int(round(cfg["block_ms"] / 1000 * CLIENT_RATE))
 
+        # Thresholds are RELATIVE to a tracked noise floor, not absolute.
+        # Absolute values cannot work: measured room tone was -45..-55 dBFS
+        # on one call, and this mic's own floor is -77. A fixed close bar
+        # either never closes (room tone above it) or clips quiet speech.
+        self.open_over_floor = float(cfg.get("open_over_floor_db", 12.0))
+        self.close_over_floor = float(cfg.get("close_over_floor_db", 6.0))
+        # Hard floor so a silent room does not make the gate hair-trigger.
+        self.min_open_db = float(cfg.get("silence_db", -60.0))
+        self.noise_floor = -55.0
+        self.hangover_blocks = max(
+            1, int(round(float(cfg.get("hangover_ms", 240.0))
+                         / cfg["block_ms"])))
+        self._speaking = False
+        self._hangover = 0
+        self.peak_db = -120.0
+
         self.blocks_in = 0
         self.blocks_gated = 0
         self.compute_ms: list[float] = []
@@ -183,10 +199,44 @@ class Session:
         n = min(res16k.shape[0], 320 * (self.block_frame // self.zc + 1))
         self.input_wav_res[-n:] = res16k[:n]
 
-        # Never convert silence -- it comes back as noise.
+        # Hysteresis gate. A single threshold cannot do this job:
+        #
+        #   at -50 dBFS it ate quiet speech (measured: api requests went to
+        #   zero because a whole session was classified as silence)
+        #   at -60 dBFS room tone gets through -- measured on a real call,
+        #   75% of "silent" blocks sat above it, so the model was handed
+        #   near-nothing and returned artifacts in the gaps
+        #
+        # So: a HIGH bar to open the gate (room tone never clears it) and a
+        # LOW bar to keep it open (quiet speech continues once started),
+        # plus a hangover so word tails are not clipped mid-decay.
         rms = float(np.sqrt(np.mean((pcm48.astype(np.float64) / 32768.0) ** 2)))
         db = 20 * np.log10(max(rms, 1e-9))
-        speech = db > self.cfg["silence_db"]
+
+        # Track the noise floor from quiet blocks only, and slowly: fast
+        # adaptation would let sustained speech drag the floor upward and
+        # gate the speaker out mid-sentence.
+        if not self._speaking:
+            k = 0.05 if db < self.noise_floor else 0.01
+            self.noise_floor += (db - self.noise_floor) * k
+
+        open_db = max(self.min_open_db, self.noise_floor + self.open_over_floor)
+        close_db = max(self.min_open_db - 6.0,
+                       self.noise_floor + self.close_over_floor)
+
+        if self._speaking:
+            if db > close_db:
+                self._hangover = self.hangover_blocks
+            else:
+                self._hangover -= 1
+                if self._hangover <= 0:
+                    self._speaking = False
+        elif db > open_db:
+            self._speaking = True
+            self._hangover = self.hangover_blocks
+
+        speech = self._speaking
+        self.peak_db = max(self.peak_db, db)
 
         if speech:
             infer = rtg.custom_infer(
@@ -277,8 +327,12 @@ async def handler(ws, default_ref: str):
         cfg.setdefault("cfg_rate", 0.0)
         cfg.setdefault("silence_db", -60.0)
         cfg.setdefault("prompt_len", 3.0)
+        cfg.setdefault("open_over_floor_db", 12.0)
+        cfg.setdefault("close_over_floor_db", 6.0)
+        cfg.setdefault("hangover_ms", 240.0)
         for k in ("extra_ce", "extra_right", "block_ms", "steps",
-                  "cfg_rate", "silence_db", "prompt_len"):
+                  "cfg_rate", "silence_db", "prompt_len",
+                  "open_over_floor_db", "close_over_floor_db", "hangover_ms"):
             if k in msg:
                 cfg[k] = msg[k]
 
@@ -315,9 +369,11 @@ async def handler(ws, default_ref: str):
         _last_active = time.time()
         if session and session.compute_ms:
             arr = np.array(session.compute_ms)
-            log.info("closed %s: %d blocks, %d gated, compute median %.0f ms "
-                     "p95 %.0f ms", peer, session.blocks_in,
-                     session.blocks_gated, np.median(arr), np.percentile(arr, 95))
+            log.info("closed %s: %d blocks, %d gated (%.0f%%), peak %.0f dBFS, "
+                     "compute median %.0f ms p95 %.0f ms", peer,
+                     session.blocks_in, session.blocks_gated,
+                     100.0 * session.blocks_gated / max(1, session.blocks_in),
+                     session.peak_db, np.median(arr), np.percentile(arr, 95))
         else:
             log.info("closed %s", peer)
 

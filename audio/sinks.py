@@ -33,6 +33,7 @@ class OutputSink:
         channels: int | None = None,
         latency="low",
         adaptive: bool = False,
+        adapt_factor: float = 1.5,
     ) -> None:
         self.label = label
         self.device = device
@@ -55,6 +56,7 @@ class OutputSink:
             target_blocks=target_blocks,
             max_blocks=max_blocks,
             adaptive=adaptive,
+            adapt_factor=adapt_factor,
         )
 
     def _callback(self, outdata, frames, time_info, status):  # noqa: ARG002
