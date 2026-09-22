@@ -130,19 +130,22 @@ def decide_config(pf: dict, preset: str = "fast") -> SessionConfig:
     jitter = pf.get("jitter_ms", 999.0)
     median = pf.get("rtt_median_ms", 999.0)
 
-    # Depth, fitted to measured runs rather than derived:
-    #    28 ms jitter -> 2 blocks ran clean; 1 block gave 8 underruns
-    #    45 ms jitter -> 2 blocks clean
-    #    90 ms jitter -> 4 blocks needed; 2 trimmed speech
-    #   131 ms jitter -> 3 blocks clean (adaptive)
-    # Buffer depth grows faster than jitter alone implies, because delivery
-    # arrives in bursts as well as late. Two blocks is the floor: below that
-    # a single late packet starves playback.
-    prefill = max(2, min(6, math.ceil(jitter / 40.0)))
+    # Trust preflight's own recommendation.
+    #
+    # This previously recomputed depth from jitter with a curve fitted by
+    # hand. It was wrong repeatedly and in both directions: on a pod
+    # measuring 152 ms round trip it chose 5 blocks (1072 ms total) for a
+    # run that was completely clean at 2 blocks (600 ms). Preflight said
+    # "use --prefill 2" and was right; the formula overrode it.
+    #
+    # Preflight derives this from the same p95 spread, so recomputing it
+    # here added a second opinion and no information.
+    prefill = max(2, min(6, int(pf.get("recommended_prefill", 2))))
 
-    # Adaptive only where a fixed guess is likely to be wrong. Jitter above
-    # roughly one block means the spread is larger than the buffer's
-    # resolution, so the right depth genuinely moves during a call.
+    # Adaptive only where a fixed guess is likely to be wrong. Measured
+    # back-to-back on one pod, adaptive grew 2 -> 3 blocks, cost 160 ms,
+    # and trimmed exactly as much audio as fixed did: none. It earns its
+    # place when conditions are genuinely bad, not as a default.
     erratic = jitter > block_ms * 1.25
     slow = median > 300
     adaptive = erratic or slow
@@ -369,8 +372,11 @@ class SessionManager:
         import tempfile
         self._stats_path = os.path.join(
             tempfile.gettempdir(), f"transend-stats-{os.getpid()}.json")
+        # Every app-run call logs a timeline, so quality problems can be
+        # traced to network conditions after the fact instead of guessed at.
         cmd = ["python", "-m", "app.stage6", "-i", input_device,
-               "--backend", "seedvc", "--stats-json", self._stats_path]
+               "--backend", "seedvc", "--stats-json", self._stats_path,
+               "--timeline", "auto"]
         if self.url:
             cmd += ["--seedvc-url", self.url]
         if self.voice and self.voice.path:

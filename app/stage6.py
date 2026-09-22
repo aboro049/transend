@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
 import sys
 import threading
 import time
@@ -30,6 +31,8 @@ import sounddevice as sd
 from audio import devices
 from audio.capture import meter, rms_dbfs
 from audio.filesource import FileSource
+from audio.monitor import NetworkMonitor
+from app.telemetry import Telemetry, default_path as telemetry_path
 from audio.sinks import FanOut, OutputSink
 from config import settings
 from routing import virtual_audio
@@ -45,6 +48,11 @@ try:
     from voice.seedvc import SeedVCConverter
 except Exception:  # websockets missing
     SeedVCConverter = None
+
+try:
+    from voice.accent import AccentConverter
+except Exception:  # websockets missing
+    AccentConverter = None
 
 
 def _latency(v: str):
@@ -75,6 +83,13 @@ class Stage6Pipeline:
         self.started_at = 0.0
         self.fatal: str | None = None
 
+        # Conditions move during a call; a startup snapshot is not enough.
+        self.telemetry = None
+        self.monitor = NetworkMonitor(
+            block_ms=self.block / settings.SAMPLE_RATE * 1000.0,
+            floor_blocks=args.prefill)
+        self._last_retarget = 0.0
+
         self._recorder: wave.Wave_write | None = None
         self._rec_lock = threading.Lock()
         self._stop = threading.Event()
@@ -91,6 +106,8 @@ class Stage6Pipeline:
         self._in_q.append(AudioChunk(seq=self.seq, pcm=mono.copy()))
         self.seq += 1
         self.captured += 1
+        if self.telemetry is not None:
+            self.telemetry.push_input(mono)
 
     async def _sender(self) -> None:
         while not self._stop.is_set():
@@ -123,7 +140,25 @@ class Stage6Pipeline:
                 return
             self.api_ms = (1 - a) * self.api_ms + a * chunk.api_latency_ms
             self.total_ms = (1 - a) * self.total_ms + a * chunk.age_ms
+
+            # Feed the live monitor and let it steer the buffer from
+            # measured round trips rather than from depth overshoot.
+            self.monitor.record(chunk.api_latency_ms)
+            if self.args.adaptive:
+                now = time.monotonic()
+                if now - self._last_retarget > 5.0:
+                    for sink in self.fanout.sinks:
+                        before = sink.buffer.target_blocks
+                        new = self.monitor.should_retarget(before)
+                        if new is not None:
+                            sink.buffer._retarget(new)
+                            if sink.buffer.target_blocks != before:
+                                self.monitor.updates += 1
+                    self._last_retarget = now
+
             self.fanout.push(chunk)
+            if self.telemetry is not None:
+                self.telemetry.push_output(chunk.pcm)
             if self._recorder:
                 with self._rec_lock:
                     self._recorder.writeframes(chunk.pcm.tobytes())
@@ -197,6 +232,24 @@ class Stage6Pipeline:
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at if self.started_at else 0.0
 
+    def net_snapshot(self) -> dict:
+        v = self.fanout.sinks[0] if self.fanout.sinks else None
+        b = v.buffer if v else None
+        in_ms = self.in_stream.latency * 1000.0 if self.in_stream else 0.0
+        return {
+            "api_ms": self.api_ms,
+            "net_jitter_ms": self.monitor.jitter_ms,
+            "net_median_ms": self.monitor.median_ms,
+            "buffer_ms": b.depth_ms if b else 0.0,
+            "target_ms": b.target_ms if b else 0.0,
+            "total_ms": in_ms + self.total_ms + (b.target_ms if b else 0.0),
+            "underruns": b.underruns if b else 0,
+            "trimmed_audio": b.trimmed_audio if b else 0,
+            "dropped": b.dropped if b else 0,
+            "input_drops": self.in_dropped,
+            "backlog_s": getattr(self.converter, "backlog_s", 0.0),
+        }
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="stage6", description="Route converted audio to a virtual mic.")
@@ -217,13 +270,49 @@ def build_parser() -> argparse.ArgumentParser:
                         "the starting point, not a fixed target.")
     p.add_argument("--duration", type=float, default=0.0)
     p.add_argument("--record", default=None)
+    a = p.add_argument_group("accent mode (--backend accent)")
+    a.add_argument("--stability", type=int, default=0,
+                   help="Partial transcripts a word must survive before it is "
+                        "spoken. 0 = immediate (fastest, may speak a revised word).")
+    a.add_argument("--flush-words", type=int, default=8,
+                   help="Words handed to TTS before forcing generation. Fewer = "
+                        "less lag, choppier phrasing.")
+    a.add_argument("--vad-silence", type=float, default=0.4,
+                   help="Seconds of silence that end a segment.")
+    a.add_argument("--idle-flush", type=float, default=1500.0,
+                   help="ms without new words before buffered words are spoken.")
+    a.add_argument("--tts-speed", type=float, default=1.1,
+                   help="TTS speaking rate (about 0.7-1.2). Raise if backlog grows.")
+    a.add_argument("--hold-last", type=int, default=1,
+                   help="Words held back from the end of each partial transcript. "
+                        "2 = fewer mis-spoken words, slightly more lag.")
+    a.add_argument("--cushion", type=float, default=0.0,
+                   help="ms of audio held before resuming after a gap. Turns "
+                        "many small stutters into fewer clean pauses.")
+    a.add_argument("--corrections", default="config/corrections.txt",
+                   help="Pronunciation fixes, one per line: written = spoken.")
+    a.add_argument("--keyterms", action="store_true",
+                   help="Also bias recognition toward the corrected names "
+                        "(ElevenLabs charges extra for keyterms).")
+    a.add_argument("--max-pause", type=float, default=350.0,
+                   help="When speech is backing up, cap pauses at this many ms.")
+    a.add_argument("--trim-above", type=float, default=999.0,
+                   help="Backlog in seconds before pauses start being trimmed.")
+    a.add_argument("--quiet-transcript", action="store_true",
+                   help="Do not print what was heard.")
+    a.add_argument("--language", default="en",
+                   help="Speech-to-text language code, or 'auto'.")
+    p.add_argument("--timeline", nargs="?", const="auto", default=None,
+                   help="Log audio quality and network every second to a "
+                        "JSONL file (default ~/.transend/sessions/). Analyse "
+                        "with: python -m tools.timeline <file>")
     p.add_argument("--stats-json", default=None,
                    help="Write the final run stats to this path as JSON, "
                         "so a parent process can record them.")
     p.add_argument("--source-file", default=None,
                    help="Drive input from a WAV instead of the mic, paced in "
                         "real time and looped. Repeatable config comparisons.")
-    p.add_argument("--backend", choices=["mock", "elevenlabs", "seedvc"],
+    p.add_argument("--backend", choices=["mock", "elevenlabs", "seedvc", "accent"],
                    default="mock",
                    help="Voice conversion backend.")
     g = p.add_argument_group("mock converter")
@@ -244,6 +333,9 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--cfg-rate", type=float, default=None,
                    help="Classifier-free guidance (0-1). 0 disables it. "
                         "Higher adheres harder to the target voice.")
+    v.add_argument("--crossfade-ms", type=float, default=None,
+                   help="Blend length at block boundaries (default 40, max ~80). "
+                        "Longer smooths pitch hand-offs between blocks.")
     v.add_argument("--prompt-len", type=float, default=None,
                    help="Seconds of reference audio used for the voice prompt.")
     v.add_argument("--reference", default=None,
@@ -256,6 +348,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # The UI stops us with SIGTERM. Without this the process dies before the
+    # summary and the stats file are written, so every UI-run session loses
+    # its counters -- which is exactly the data the history exists to keep.
+    def _on_term(_sig, _frm):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _on_term)
 
     print(devices.environment_report())
     print()
@@ -312,7 +411,31 @@ def main(argv: list[str] | None = None) -> int:
                 ("steps", args.steps),
                 ("cfg_rate", args.cfg_rate),
                 ("prompt_len", args.prompt_len),
+                ("crossfade_ms", args.crossfade_ms),
             ) if v is not None},
+        )
+    elif args.backend == "accent":
+        from voice.corrections import load_corrections
+        corr = load_corrections(args.corrections)
+        if AccentConverter is None:
+            print("[FATAL] accent backend needs websockets: pip install websockets",
+                  file=sys.stderr)
+            return 6
+        import os
+        converter = AccentConverter(
+            api_key=os.getenv("ELEVENLABS_API_KEY", ""),
+            voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+            block_frames=args.block,
+            tts_model=os.getenv("ELEVENLABS_TTS_MODEL", "eleven_turbo_v2_5"),
+            tts_speed=args.tts_speed,
+            language=None if args.language == "auto" else args.language,
+            stability=args.stability, flush_words=args.flush_words,
+            hold_last=args.hold_last,
+            vad_silence_s=args.vad_silence, idle_flush_ms=args.idle_flush,
+            cushion_ms=args.cushion, corrections=corr,
+            keyterms=list(corr) if args.keyterms else None,
+            max_pause_ms=args.max_pause, trim_above_s=args.trim_above,
+            show_transcript=not args.quiet_transcript,
         )
     elif args.backend == "elevenlabs":
         if ElevenLabsConverter is None:
@@ -349,7 +472,12 @@ def main(argv: list[str] | None = None) -> int:
             latency=_latency(args.latency), adaptive=args.adaptive,
         adapt_factor=args.adapt_factor))
 
-    if args.backend == "seedvc":
+    if args.backend == "accent":
+        print(f"[VOICE] backend  : accent  speech-to-text -> TTS "
+              f"({converter.model_id}, speed {args.tts_speed})")
+        print(f"[VOICE] tuning   : stability {args.stability}, flush every "
+              f"{args.flush_words} words, segment after {args.vad_silence}s silence")
+    elif args.backend == "seedvc":
         print(f"[VOICE] backend  : seedvc preset={args.preset} -> {converter.url}")
     elif args.backend == "elevenlabs":
         print(f"[VOICE] backend  : elevenlabs voice='{converter.voice_name}' "
@@ -385,6 +513,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.backend == "seedvc":
         print(f"[VOICE] server cfg: {converter.server_config}")
     in_ms = pipe.in_stream.latency * 1000.0
+    if args.timeline:
+        tl_path = telemetry_path() if args.timeline == "auto" else args.timeline
+        pipe.telemetry = Telemetry(tl_path, pipe.net_snapshot)
+        pipe.telemetry.start()
+        print(f"[LOG]   timeline -> {tl_path}")
     print()
     print("=" * 60)
     print(f"  In Zoom, set Microphone to:  {zoom_name}")
@@ -413,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"\rIN {meter(pipe.input_level, 10)} VIRT {meter(virt_sink.level, 10)} {mon}"
                 f" api {pipe.api_ms:>4.0f}ms buf {virt_sink.buffer.depth_ms:>4.0f}ms"
                 f" TOTAL {total:>5.0f}ms  tgt {virt_sink.buffer.target_ms:>4.0f}ms"
+                f" jit {pipe.monitor.jitter_ms:>3.0f}ms"
                 f" under {pipe.fanout.underruns}"
                 f" trim {virt_sink.buffer.trimmed_silent}/{virt_sink.buffer.trimmed_audio}"
                 f" ovf {pipe.overflows}   "
@@ -462,9 +596,51 @@ def main(argv: list[str] | None = None) -> int:
               f"({converter.api_errors} errors, {converter.lost} lost)")
         print(f"  silence trimmed  : {converter.trimmed_out_ms / 1000:.1f}s before "
               f"upload, {converter.trimmed_in_ms / 1000:.1f}s from responses")
+    print(f"  {pipe.monitor.summary()}")
+    if pipe.monitor.updates:
+        print(f"  buffer retargets : {pipe.monitor.updates} "
+              f"(live, from measured round trips)")
     print(f"  input drops      : {pipe.in_dropped}")
     print(f"  input overflows  : {pipe.overflows}")
     print("=" * 62)
+
+    if args.backend == "accent":
+        a = converter.summary()
+        v0 = pipe.fanout.sinks[0].buffer if pipe.fanout.sinks else None
+        extra = in_ms + (v0.target_ms if v0 else 0.0)
+        print("  ---------------------------------------------------------- accent")
+        print(f"  words spoken     : {a['words_spoken']} in {a['segments']} segments, "
+              f"{a['flushes']} flushes")
+        print(f"  revised after    : {a['revisions_after_speaking']} "
+              f"(words spoken, then re-heard differently)")
+        if a["word_lag_samples"]:
+            print(f"  word lag         : median {a['word_lag_ms_median']:.0f} ms, "
+                  f"p95 {a['word_lag_ms_p95']:.0f} ms  ({a['word_lag_samples']} words, "
+                  f"spoken -> handed to pipeline)")
+            print(f"    where it goes  : recognise {a['stage_asr_ms']:.0f} ms"
+                  f" -> hold {a['stage_hold_ms']:.0f} ms"
+                  f" -> TTS+queue {a['stage_tts_ms']:.0f} ms  (medians)")
+            print(f"  est. to far end  : ~{a['word_lag_ms_median'] + extra:.0f} ms "
+                  f"median  (+ buffer {extra:.0f} ms incl. input hw)")
+        else:
+            print("  word lag         : no timed words yet (needs completed segments)")
+        print(f"  TTS first audio  : {a['tts_first_audio_ms_median']:.0f} ms median")
+        print(f"  pauses trimmed   : {a['pause_trimmed_s']:.1f} s recovered from backlog")
+        if a["corrections_applied"]:
+            print(f"  corrections      : {a['corrections_applied']} words re-spelled for TTS")
+        print(f"  backlog at end   : {a['backlog_s_end']:.2f} s "
+              f"{'<- growing: raise --tts-speed' if a['backlog_s_end'] > 1.5 else ''}")
+    if pipe.telemetry is not None:
+        v = pipe.fanout.sinks[0].buffer if pipe.fanout.sinks else None
+        pipe.telemetry.stop(summary={
+            "ran_for_s": round(pipe.elapsed, 1), "sent": converter.sent,
+            "received": converter.received,
+            "underruns": v.underruns if v else 0,
+            "trimmed_audio": v.trimmed_audio if v else 0,
+            "preset": getattr(args, "preset", ""), "adaptive": bool(args.adaptive),
+            "prefill": args.prefill, "block": args.block})
+        print(f"\n[LOG]   {pipe.telemetry.rows} seconds logged -> "
+              f"python -m tools.timeline {pipe.telemetry.path}")
 
     if args.stats_json:
         # The summary above is for a human. This is the same run, in a shape

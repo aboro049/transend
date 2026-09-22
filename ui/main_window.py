@@ -364,7 +364,11 @@ class App:
     def on_stop(self) -> None:
         if self.live_proc and self.live_proc.poll() is None:
             self.live_proc.terminate()
-            threading.Timer(3.0, self._kill).start()
+            # Wait for it to write its stats file before reading history.
+            try:
+                self.live_proc.wait(timeout=4.0)
+            except Exception:
+                self._kill()
         self.live_proc = None
         # Persist the session before anything else can go wrong: conditions
         # vary enormously between runs and the record is how they get
@@ -384,6 +388,10 @@ class App:
         the expensive failure mode is closing the window and forgetting."""
         if self.live_proc and self.live_proc.poll() is None:
             self.live_proc.terminate()
+            try:
+                self.live_proc.wait(timeout=4.0)
+            except Exception:
+                pass
         if self.session:
             self.session.save_history()
 
