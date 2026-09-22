@@ -286,6 +286,11 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--hold-last", type=int, default=1,
                    help="Words held back from the end of each partial transcript. "
                         "2 = fewer mis-spoken words, slightly more lag.")
+    a.add_argument("--tempo", action="store_true",
+                   help="Adaptive tempo: while speech queues up, play it a few "
+                        "percent faster, pitch-preserved. Stops drift on long speech.")
+    a.add_argument("--tempo-max", type=float, default=1.08,
+                   help="Fastest tempo allowed when catching up (1.08 = 8%%).")
     a.add_argument("--cushion", type=float, default=0.0,
                    help="ms of audio held before resuming after a gap. Turns "
                         "many small stutters into fewer clean pauses.")
@@ -436,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
             keyterms=list(corr) if args.keyterms else None,
             max_pause_ms=args.max_pause, trim_above_s=args.trim_above,
             show_transcript=not args.quiet_transcript,
+            tempo=args.tempo, tempo_max=args.tempo_max,
         )
     elif args.backend == "elevenlabs":
         if ElevenLabsConverter is None:
@@ -628,6 +634,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  pauses trimmed   : {a['pause_trimmed_s']:.1f} s recovered from backlog")
         if a["corrections_applied"]:
             print(f"  corrections      : {a['corrections_applied']} words re-spelled for TTS")
+        print("  ------------------------------------------------ what the listener feels")
+        if a["short_reply_n"]:
+            print(f"  short replies    : start heard {a['short_reply_ms']:.0f} ms after "
+                  f"speaker started  ({a['short_reply_n']} replies)")
+        if a["long_n"]:
+            print(f"  long speech      : start heard {a['long_start_ms']:.0f} ms after "
+                  f"speaker started  ({a['long_n']} utterances)")
+        if a["drift_s_per_min"] is not None:
+            print(f"  drift            : {a['drift_s_per_min']:+.2f} s per minute of "
+                  f"continuous speech  (0 = lag only at the start)")
+        if a["tempo_on"]:
+            print(f"  adaptive tempo   : up to {a['tempo_rate_max']:.3f}x, "
+                  f"recovered {a['tempo_saved_s']:.1f} s")
+        print(f"  backlog          : max {a['backlog_s_max']:.2f} s")
         print(f"  backlog at end   : {a['backlog_s_end']:.2f} s "
               f"{'<- growing: raise --tts-speed' if a['backlog_s_end'] > 1.5 else ''}")
     if pipe.telemetry is not None:

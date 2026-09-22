@@ -93,6 +93,7 @@ class _Piece:
     t_sent: float
     t_recv: float
     char_start: int          # offset of this audio's first char in the TTS stream
+    meta_i: int = -1         # index into the audio ledger
     released: bool = False
 
 
@@ -111,6 +112,8 @@ class AccentConverter(StreamingConverter):
                  cushion_ms: float = 0.0, corrections: dict | None = None,
                  keyterms: list[str] | None = None, max_pause_ms: float = 350.0,
                  trim_above_s: float = 999.0, show_transcript: bool = True,
+                 tempo: bool = False, tempo_target_s: float = 0.6,
+                 tempo_max: float = 1.08,
                  log=print) -> None:
         if not api_key:
             raise ConverterError("ELEVENLABS_API_KEY not set")
@@ -150,6 +153,18 @@ class AccentConverter(StreamingConverter):
         self.max_pause = int(max_pause_ms / 1000.0 * sample_rate)
         self.trim_above_s = trim_above_s
         self.show_transcript = show_transcript
+        # Adaptive tempo: while speech is queuing up, play it a few percent
+        # faster, pitch-preserved, then ease back. Off by default. See
+        # voice/tempo.py for why this is used instead of the TTS speed knob.
+        self.tempo_target_s, self.tempo_max = tempo_target_s, tempo_max
+        self._tempo = None
+        if tempo:
+            from voice.tempo import WSOLA
+            self._tempo = WSOLA(sample_rate)
+        self._rate = 1.0
+        self.rate_max_seen = 1.0
+        self.tempo_saved_s = 0.0
+        self._last_meta = None
         self._tts_rate = int(tts_format.split("_")[1])
         self._up_factor = sample_rate // self._tts_rate
 
@@ -184,7 +199,15 @@ class AccentConverter(StreamingConverter):
         self._next_release: float | None = None
         self._last_audio_t = 0.0
         self._audio_evt = asyncio.Event()
-        self._release_log: list[tuple[int, float]] = []   # (char_start, released_at)
+        # Audio ledger: one entry per piece of generated audio, in order --
+        # [char_start, released_at or None]. Words are matched to audio LAZILY,
+        # at report time. Matching them when the transcript finalised read lag
+        # too LOW under backlog: a word whose audio had not played yet got
+        # matched to an earlier piece that had.
+        self._meta: list[list] = []
+        self._meta_chars: list[int] = []
+        self._records: list[dict] = []
+        self.backlog_max_s = 0.0
 
         # mic audio clock: maps Scribe word timestamps back to capture time
         self._stt_audio_s = 0.0
@@ -194,14 +217,10 @@ class AccentConverter(StreamingConverter):
         # stats
         self.sent = self.received = 0
         self.words_spoken = self.flushes = self.revisions = self.segments = 0
-        self.word_lags: list[float] = []
-        # Lag split into its stages, per word:
+        # Lag stages, per word (see properties below):
         #   asr   spoken -> first appears in a partial transcript
         #   hold  first seen -> handed to TTS (stability + trailing-word wait)
         #   tts   handed to TTS -> audio released (generation + queue)
-        self.stage_asr: list[float] = []
-        self.stage_hold: list[float] = []
-        self.stage_tts: list[float] = []
         self.tts_first_audio: list[float] = []
         self.trimmed_pause_s = 0.0
         self.corrected = 0
@@ -378,32 +397,78 @@ class AccentConverter(StreamingConverter):
         self._revision_flag = False
 
     def _on_timestamps(self, msg: dict) -> None:
-        """Join Scribe's word times to when each word's audio was released."""
+        """Record when each word was spoken; its audio is matched later."""
         if not self._pending_ts:
             return
         seg = self._pending_ts.popleft()
         words = [w for w in (msg.get("words") or [])
                  if w.get("type", "word") == "word" and "start" in w]
-        rel_chars = [c for c, _ in self._release_log]
         for i, w in enumerate(words):
             entry = self._word_log.pop((seg, i), None)
             if not entry or entry[0] != _norm(w.get("text", "")):
                 continue
-            # Measure from the word's END: it cannot be recognised before it
-            # has been fully spoken, so that is where the pipeline's clock
-            # really starts.
-            spoken = self._spoken_at(float(w.get("end", w["start"])))
-            j = bisect.bisect_right(rel_chars, entry[1]) - 1
-            if spoken is None or j < 0:
+            s0 = self._spoken_at(float(w["start"]))
+            s1 = self._spoken_at(float(w.get("end", w["start"])))
+            if s0 is None or s1 is None:
                 continue
-            released = self._release_log[j][1]
-            _, _, t_seen, t_sent = entry
-            self.word_lags.append(released - spoken)
-            self.stage_asr.append(t_seen - spoken)
-            self.stage_hold.append(t_sent - t_seen)
-            self.stage_tts.append(released - t_sent)
+            _, off, t_seen, t_sent = entry
+            self._records.append({"seg": seg, "i": i, "n": len(words), "s0": s0,
+                                  "s1": s1, "seen": t_seen, "sent": t_sent, "off": off})
 
-    # ---------------------------------------------------------------- TTS path
+    def _resolved(self) -> list[tuple[dict, float]]:
+        """Words whose audio has actually been released, with release time."""
+        out = []
+        for r in self._records:
+            j = bisect.bisect_right(self._meta_chars, r["off"]) - 1
+            if j >= 0 and self._meta[j][1] is not None:
+                out.append((r, self._meta[j][1]))
+        return out
+
+    # Measured from the word's END: it cannot be recognised before it has
+    # been fully spoken, so that is where the pipeline's clock really starts.
+    @property
+    def word_lags(self) -> list[float]:
+        return [rel - r["s1"] for r, rel in self._resolved()]
+
+    @property
+    def stage_asr(self) -> list[float]:
+        return [r["seen"] - r["s1"] for r, _ in self._resolved()]
+
+    @property
+    def stage_hold(self) -> list[float]:
+        return [r["sent"] - r["seen"] for r, _ in self._resolved()]
+
+    @property
+    def stage_tts(self) -> list[float]:
+        return [rel - r["sent"] for r, rel in self._resolved()]
+
+    def segment_stats(self, short_words: int = 6) -> dict:
+        """The two experiences a listener actually has.
+
+        start delay  from the moment the speaker STARTED an utterance to the
+                     moment the listener hears it begin. For a short reply
+                     this is the wait after asking a question.
+        drift        for long speech, how much further behind it falls per
+                     minute -- zero means "lag only at the start".
+        """
+        segs: dict[int, list] = {}
+        for r, rel in self._resolved():
+            segs.setdefault(r["seg"], []).append((r, rel))
+        short, long_start, drift = [], [], []
+        for items in segs.values():
+            items.sort(key=lambda t: t[0]["i"])
+            (f, frel), (l, lrel) = items[0], items[-1]
+            if f["i"] != 0:
+                continue                      # first word unmatched: skip
+            start = frel - f["s0"]
+            if f["n"] <= short_words:
+                short.append(start)
+            else:
+                long_start.append(start)
+                span = l["s0"] - f["s0"]
+                if span >= 3.0:
+                    drift.append(((lrel - l["s0"]) - start) / span * 60.0)
+        return {"short": short, "long_start": long_start, "drift": drift}    # ---------------------------------------------------------------- TTS path
 
     async def _speak(self, words: list[str]) -> None:
         if not words:
@@ -534,12 +599,12 @@ class AccentConverter(StreamingConverter):
                         head[3] = now
                         self.tts_first_audio.append(now - head[2])
                     up = self._compress_pauses(self._upsample(pcm))
+                    if self._tempo is not None:
+                        up = self._apply_tempo(up)
+                    self._last_meta = (head[1], head[2], head[3])
+                    self._last_audio_t = now
                     if up.size:
-                        self._fifo.append(_Piece(up, head[1], head[2], head[3],
-                                                 self._recv_chars))
-                        self._fifo_samples += up.size
-                        self._last_audio_t = now
-                        self._audio_evt.set()
+                        self._append(up, head[1], head[2], head[3])
                     self._recv_chars += n_chars
                     left = n_chars
                     while left and self._batches:
@@ -556,6 +621,27 @@ class AccentConverter(StreamingConverter):
 
     # ------------------------------------------------------------ output path
 
+    def _append(self, pcm: np.ndarray, tag: float, t_sent: float,
+                t_recv: float) -> None:
+        i = len(self._meta)
+        self._meta.append([self._recv_chars, None])
+        self._meta_chars.append(self._recv_chars)
+        self._fifo.append(_Piece(pcm, tag, t_sent, t_recv, self._recv_chars, i))
+        self._fifo_samples += pcm.size
+        self.backlog_max_s = max(self.backlog_max_s, self.backlog_s)
+        self._audio_evt.set()
+
+    def _apply_tempo(self, x: np.ndarray) -> np.ndarray:
+        # Target rate rises with how far behind we are; smoothed so the
+        # speed eases in and out rather than stepping.
+        behind = max(0.0, self.backlog_s - self.tempo_target_s)
+        target = min(self.tempo_max, 1.0 + 0.1 * behind)
+        self._rate += (target - self._rate) * 0.3
+        self.rate_max_seen = max(self.rate_max_seen, self._rate)
+        y = self._tempo.process(x, self._rate)
+        self.tempo_saved_s += max(0.0, x.size - y.size) / self.sr
+        return y
+
     @property
     def backlog_s(self) -> float:
         """Speech generated but not yet played. Growth here is drift."""
@@ -570,7 +656,8 @@ class AccentConverter(StreamingConverter):
             p = self._fifo[0]
             if not p.released:
                 p.released = True
-                self._release_log.append((p.char_start, now))
+                if 0 <= p.meta_i < len(self._meta):
+                    self._meta[p.meta_i][1] = now
             k = min(n - pos, p.pcm.size)
             out[pos:pos + k] = p.pcm[:k]
             pos += k
@@ -579,8 +666,6 @@ class AccentConverter(StreamingConverter):
             else:
                 p.pcm = p.pcm[k:]
         self._fifo_samples -= pos
-        if len(self._release_log) > 20000:
-            self._release_log = self._release_log[-10000:]
         return out, first
 
     async def receive(self) -> AudioChunk | None:
@@ -590,6 +675,13 @@ class AccentConverter(StreamingConverter):
             if self._closing:
                 return None
             now = time.perf_counter()
+            # End of an utterance: the tempo stage holds ~50 ms of lookahead,
+            # so emit it once no new audio has arrived for a moment.
+            if (self._tempo is not None and self._tempo.pending
+                    and now - self._last_audio_t > 0.2 and self._last_meta):
+                tail = self._tempo.flush()
+                if tail.size:
+                    self._append(tail, *self._last_meta)
             tail_ready = (0 < self._fifo_samples < self.block
                           and now - self._last_audio_t > 0.25)
             gap = self._next_release is None or self._next_release < now - self.block_s
@@ -636,6 +728,7 @@ class AccentConverter(StreamingConverter):
         return self._ready and not self._closing and not self._fatal
 
     def summary(self) -> dict:
+        seg = self.segment_stats()
         lags = np.array(self.word_lags) * 1000.0
         ttfa = np.array(self.tts_first_audio) * 1000.0
         pct = lambda a, q: float(np.percentile(a, q)) if a.size else 0.0
@@ -649,6 +742,15 @@ class AccentConverter(StreamingConverter):
             "stage_tts_ms": pct(np.array(self.stage_tts) * 1000.0, 50),
             "tts_first_audio_ms_median": pct(ttfa, 50),
             "backlog_s_end": round(self.backlog_s, 2),
+            "backlog_s_max": round(self.backlog_max_s, 2),
+            "short_reply_ms": pct(np.array(seg["short"]) * 1000.0, 50),
+            "short_reply_n": len(seg["short"]),
+            "long_start_ms": pct(np.array(seg["long_start"]) * 1000.0, 50),
+            "long_n": len(seg["long_start"]),
+            "drift_s_per_min": round(float(np.median(seg["drift"])), 2) if seg["drift"] else None,
+            "tempo_on": self._tempo is not None,
+            "tempo_rate_max": round(self.rate_max_seen, 3),
+            "tempo_saved_s": round(self.tempo_saved_s, 2),
             "pause_trimmed_s": round(self.trimmed_pause_s, 2),
             "corrections_applied": self.corrected,
         }
