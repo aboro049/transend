@@ -356,6 +356,49 @@ def get_token() -> str:
     return t
 
 
+def selftest() -> int:
+    """Prove a packaged build works, without a GPU or a web app.
+
+    A frozen executable can be missing a pure-Python dependency and still
+    start, failing only when that code path runs. This forces every import
+    and lists the audio devices, so a tester gets one clear answer.
+    """
+    ok = True
+    print("TRANSEND agent self-test\n")
+    for mod, why in (("numpy", "audio maths"), ("sounddevice", "microphone"),
+                     ("websockets", "talking to the GPU server")):
+        try:
+            __import__(mod)
+            print(f"  [ ok ] {mod:<14} {why}")
+        except Exception as exc:
+            ok = False
+            print(f"  [FAIL] {mod:<14} {why}: {exc}")
+    try:
+        import sounddevice as sd
+        ins = [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
+        print(f"\n  microphones found: {len(ins)}")
+        for n in ins[:6]:
+            print(f"    - {n}")
+    except Exception as exc:
+        ok = False
+        print(f"\n  [FAIL] cannot list audio devices: {exc}")
+    virt = None
+    try:
+        virt = virtual_audio.default_virtual_output()
+    except Exception:
+        pass
+    if virt:
+        print(f"\n  [ ok ] virtual device: {virt[1]['name']}")
+        print(f"         in your call app choose: "
+              f"{virtual_audio.call_app_input_name(virt[1]['name'])}")
+    else:
+        ok = False
+        print(f"\n  [FAIL] no virtual audio device")
+        print(f"         {virtual_audio.install_hint()}")
+    print("\n" + ("ready to use" if ok else "not ready -- see the FAIL lines above"))
+    return 0 if ok else 1
+
+
 def main(argv=None) -> int:
     import argparse
     p = argparse.ArgumentParser(prog="agent")
@@ -366,9 +409,14 @@ def main(argv=None) -> int:
                    help="seed-vc server address (wss://...). Overrides .env.")
     p.add_argument("--reference", default=None,
                    help="Voice reference WAV to convert to. Overrides voices/.")
+    p.add_argument("--selftest", action="store_true",
+                   help="Check this build has everything it needs, then exit.")
     p.add_argument("--origin", action="append", default=[],
                    help="Web app origin allowed to drive this agent. Repeatable.")
     args = p.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
 
     origins = args.origin or [o for o in
                               os.getenv("TRANSEND_ORIGINS", "").split(",") if o]
