@@ -58,7 +58,7 @@ class Voice:
 class SessionConfig:
     """What the measured conditions say we should run."""
 
-    preset: str = "fast"
+    preset: str = "quality"
     block: int = 7680
     prefill: int = 2
     queue: int = 48
@@ -111,7 +111,7 @@ def grade(total_ms: float, loss_risk: bool) -> tuple[str, str]:
     return "POOR", "too laggy for comfortable conversation"
 
 
-def decide_config(pf: dict, preset: str = "fast") -> SessionConfig:
+def decide_config(pf: dict, preset: str = "quality") -> SessionConfig:
     """Size the buffer from jitter, then choose fixed or adaptive.
 
     Buffer depth must cover the WORST round trip, not the median -- that is
@@ -125,7 +125,7 @@ def decide_config(pf: dict, preset: str = "fast") -> SessionConfig:
     a round trip already slow enough that discarding speech is the
     alternative.
     """
-    block = PRESET_BLOCKS.get(preset, 7680)
+    block = PRESET_BLOCKS.get(preset, 15360)
     block_ms = block / 48000 * 1000
     jitter = pf.get("jitter_ms", 999.0)
     median = pf.get("rtt_median_ms", 999.0)
@@ -141,14 +141,26 @@ def decide_config(pf: dict, preset: str = "fast") -> SessionConfig:
     # Preflight derives this from the same p95 spread, so recomputing it
     # here added a second opinion and no information.
     prefill = max(2, min(6, int(pf.get("recommended_prefill", 2))))
+    # Preflight sizes the buffer for a FIXED depth -- enough to ride out the
+    # worst packet without help. With adaptive it is the BASELINE the buffer
+    # returns to, and it can grow within seconds when a spike arrives, so it
+    # starts one block thinner. Measured: prefill 1 + adaptive gave 552 ms
+    # and 1% chopped words, against 890 ms for a fixed prefill 2.
+    baseline = max(1, prefill - 1)
 
-    # Adaptive only where a fixed guess is likely to be wrong. Measured
-    # back-to-back on one pod, adaptive grew 2 -> 3 blocks, cost 160 ms,
-    # and trimmed exactly as much audio as fixed did: none. It earns its
-    # place when conditions are genuinely bad, not as a default.
+    # Adaptive always. Measured back to back on live calls once the monitor
+    # was fixed to return to baseline: adaptive gave the LOWEST latency and
+    # the fewest chopped words of any setting --
+    #     fixed prefill 2   2% chopped, ~890 ms
+    #     fixed prefill 1   6% chopped, ~576 ms
+    #     adaptive          1% chopped, ~552 ms
+    # It runs thin while the network is calm and thickens only when a spike
+    # would otherwise cut a word, then returns to the chosen prefill.
+    # Earlier this was limited to bad networks, because a bug let the buffer
+    # grow and never shrink back.
     erratic = jitter > block_ms * 1.25
     slow = median > 300
-    adaptive = erratic or slow
+    adaptive = True
 
     if adaptive:
         # Start AT the measured depth, never below it. Starting low and
@@ -162,14 +174,15 @@ def decide_config(pf: dict, preset: str = "fast") -> SessionConfig:
         reason = "stable network -- fixed buffer, lowest latency"
         queue = 48
 
-    total = 118.5 + median + prefill * block_ms
+    total = 118.5 + median + (baseline if adaptive else prefill) * block_ms
     # Beyond this the buffer cannot absorb the spread and audio is lost
     # whatever we choose: a measured 509 ms round trip with 200 ms jitter
     # dropped 57 blocks at the input queue before they were ever sent.
     loss_risk = jitter > 180 or median > 450
     verdict, note = grade(total, loss_risk)
 
-    cfg = SessionConfig(preset, block, prefill, queue, adaptive=adaptive,
+    cfg = SessionConfig(preset, block, baseline if adaptive else prefill,
+                        queue, adaptive=adaptive,
                         reason=reason)
     cfg.verdict = verdict
     cfg.verdict_note = note
@@ -183,7 +196,12 @@ log = logging.getLogger("transend")
 class SessionManager:
     """Drives IDLE -> ... -> READY, reporting progress to a callback."""
 
-    def __init__(self, url: str = "", voice: Voice = None, preset: str = "fast",
+    # "quality" (320 ms server blocks), not "fast" (160 ms). Measured: at
+    # 160 ms blocks the converted voice carries ~2x natural speech's pitch
+    # wobble in the 5-10 Hz band -- heard as a shaky, crying quality -- while
+    # 320 ms blocks match natural speech. The extra block costs ~160 ms and
+    # is the single biggest quality setting in live mode.
+    def __init__(self, url: str = "", voice: Voice = None, preset: str = "quality",
                  on_change=None, region: str | None = None):
         # May be empty: when pod management is on, the URL is derived from
         # whichever pod we end up with rather than pinned in .env.

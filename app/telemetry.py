@@ -233,6 +233,8 @@ class Telemetry:
             "dropped": int(self._delta("d", net.get("dropped", 0))),
             "input_drops": int(self._delta("id", net.get("input_drops", 0))),
             "backlog_s": round(net.get("backlog_s", 0.0), 2),
+            "stt_rtt_ms": round(net.get("stt_rtt_ms", 0.0), 1),
+            "tts_rtt_ms": round(net.get("tts_rtt_ms", 0.0), 1),
             # --- your live voice ---
             "in_level_db": round(mi["level_db"], 1),
             "in_voiced_pct": round(mi["voiced_pct"], 1),

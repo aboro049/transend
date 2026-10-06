@@ -113,7 +113,9 @@ class AccentConverter(StreamingConverter):
                  keyterms: list[str] | None = None, max_pause_ms: float = 350.0,
                  trim_above_s: float = 999.0, show_transcript: bool = True,
                  tempo: bool = False, tempo_target_s: float = 0.6,
-                 tempo_max: float = 1.08,
+                 tempo_max: float = 1.08, first_flush: int = 0,
+                 speak_on_silence_ms: float = 0.0, ping_every_s: float = 2.0,
+                 pre_roll_ms: float = 0.0,
                  log=print) -> None:
         if not api_key:
             raise ConverterError("ELEVENLABS_API_KEY not set")
@@ -161,6 +163,49 @@ class AccentConverter(StreamingConverter):
         if tempo:
             from voice.tempo import WSOLA
             self._tempo = WSOLA(sample_rate)
+        # Quick start: flush the FIRST few words of each utterance so audio
+        # starts moving, then return to natural boundaries. Measured: flushing
+        # every 3 words gave 0.2 s to first audio against 1.2 s at 8 -- but
+        # broke phrasing throughout. Doing it once per utterance keeps the
+        # gain at the start, where the listener is waiting. 0 = off.
+        self.first_flush = max(0, first_flush)
+        self._seg_flushed = False
+        # Speak on silence: the last word of a transcript is held in case it
+        # is cut mid-word. Once the mic has been quiet this long, the speaker
+        # has finished, so it cannot be half-spoken -- release it. Without
+        # this a one-word reply ("yes") waits for Scribe's end-of-speech
+        # commit, because a single word is always the last word. 0 = off.
+        self.sos_s = speak_on_silence_ms / 1000.0
+        self._last_voice_t = 0.0
+        self.silence_releases = 0
+        # How long after the speaker stops does Scribe commit the segment?
+        # Until then the last word of every sentence is held -- this is the
+        # pause before final words. Measured so speak-on-silence can be set
+        # just below it: fast enough to help, long enough to skip breaths.
+        self.end_detect: list[float] = []
+        self._seg_text: dict[int, str] = {}
+        self._seg_commit: dict[int, float] = {}
+        # Pre-roll: at the START of an utterance, wait this long before the
+        # voice begins. Measured on a live call: every mid-sentence break
+        # (350-500 ms) landed 1.5-2.3 s into the voice -- the first chunk of
+        # speech playing out before the next had been generated -- and
+        # final words arrived ~270 ms late. Starting later by the size of
+        # those gaps leaves audio in hand to cover them.
+        # Time-based and start-only on purpose: an amount-based cushion was
+        # satisfied instantly by the first burst and bought nothing, and
+        # applying it after every gap added pauses mid-sentence.
+        self.pre_roll_s = pre_roll_ms / 1000.0
+        self._hold_until: float | None = None
+        self._last_release_t = 0.0
+        self.pre_rolls = 0
+        # Serialises "decide what is unspoken -> speak it". Partials, commits
+        # and the silence timer can all speak; without this two of them could
+        # read the same unspoken tail and speak it twice.
+        self._decide = asyncio.Lock()
+        # Network: timed WebSocket pings to both ElevenLabs connections, so
+        # lag can be split into network and processing. Measurement only.
+        self.ping_every_s = ping_every_s
+        self._rtt: dict[str, list[tuple[float, float]]] = {"stt": [], "tts": []}
         self._rate = 1.0
         self.rate_max_seen = 1.0
         self.tempo_saved_s = 0.0
@@ -251,6 +296,8 @@ class AccentConverter(StreamingConverter):
         self._tasks = [loop.create_task(c) for c in (
             self._stt_sender(), self._stt_reader(), self._tts_reader(),
             self._idle_flusher(), self._keepalive())]
+        if self.ping_every_s > 0:
+            self._tasks.append(loop.create_task(self._pinger()))
         self._ready = True
 
     async def _open_tts(self, hdr: dict) -> None:
@@ -277,6 +324,9 @@ class AccentConverter(StreamingConverter):
         if self._fatal:
             raise ConverterError(self._fatal)
         chunk.t_sent = time.perf_counter()
+        pcm = chunk.pcm.astype(np.float32)
+        if pcm.size and 20 * np.log10(max(float(np.sqrt((pcm ** 2).mean())), 1.0) / 32768) > -45:
+            self._last_voice_t = chunk.t_sent
         try:
             self._in.put_nowait(chunk)
         except asyncio.QueueFull:
@@ -345,6 +395,10 @@ class AccentConverter(StreamingConverter):
                 self._fatal = f"speech-to-text connection lost: {exc}"
 
     async def _on_partial(self, text: str) -> None:
+        async with self._decide:
+            await self._on_partial_locked(text)
+
+    async def _on_partial_locked(self, text: str) -> None:
         words = text.split()
         self._hist.append(words)
         now = time.perf_counter()
@@ -352,17 +406,21 @@ class AccentConverter(StreamingConverter):
             n = _norm(w)
             if self._first_seen.get(i, ("", 0.0))[0] != n:
                 self._first_seen[i] = (n, now)
-        if len(words) <= self.hold_last:
+        quiet = (self.sos_s > 0 and self._last_voice_t > 0
+                 and time.perf_counter() - self._last_voice_t >= self.sos_s)
+        hold = 0 if quiet else self.hold_last
+        if len(words) <= hold:
             return
-        # The last word of a partial is often cut mid-word ("wor"); never speak it.
-        cand = words[:-self.hold_last]
+        # The last word of a partial is often cut mid-word ("wor"); never speak
+        # it -- unless the speaker has gone quiet, in which case it is whole.
+        cand = words[:-hold] if hold else list(words)
         stable = len(cand)
-        if self.stability:
+        if self.stability and not quiet:
             recent = list(self._hist)[-(self.stability + 1):-1]
             if len(recent) < self.stability:
                 return
             for prev in recent:
-                p = prev[:-self.hold_last]
+                p = prev[:-hold] if hold else prev
                 k = 0
                 while k < min(stable, len(p)) and _norm(cand[k]) == _norm(p[k]):
                     k += 1
@@ -375,9 +433,23 @@ class AccentConverter(StreamingConverter):
                 self._revision_flag = True
         if stable > sent:
             await self._speak(cand[sent:stable])
+            if quiet:
+                self.silence_releases += 1
+                await self._flush()
 
     async def _on_commit(self, text: str) -> None:
+        async with self._decide:
+            await self._on_commit_locked(text)
+
+    async def _on_commit_locked(self, text: str) -> None:
         words = text.split()
+        if words and self._last_voice_t:
+            gap = time.perf_counter() - self._last_voice_t
+            if 0 < gap < 5:
+                self.end_detect.append(gap)
+        if words:
+            self._seg_text[self._seg_id] = text
+            self._seg_commit[self._seg_id] = time.perf_counter()
         if self.show_transcript and words:
             self.log(f"\n[heard] {text}")
         sent = len(self._seg_sent)
@@ -395,6 +467,7 @@ class AccentConverter(StreamingConverter):
         self._hist.clear()
         self._first_seen = {}
         self._revision_flag = False
+        self._seg_flushed = False
 
     def _on_timestamps(self, msg: dict) -> None:
         """Record when each word was spoken; its audio is matched later."""
@@ -441,6 +514,32 @@ class AccentConverter(StreamingConverter):
     @property
     def stage_tts(self) -> list[float]:
         return [rel - r["sent"] for r, rel in self._resolved()]
+
+    def segment_table(self, t0: float) -> list[dict]:
+        """One row per sentence, on the session timeline (seconds from t0).
+
+        spoken_*  when the speaker said it (from Scribe word timestamps)
+        heard_*   when its first / last word's audio was released
+        commit    when Scribe decided the sentence had ended
+        Consecutive rows expose the gap BETWEEN sentences: heard_start of
+        one against heard_last_word of the previous.
+        """
+        segs: dict[int, list] = {}
+        for r, rel in self._resolved():
+            segs.setdefault(r["seg"], []).append((r, rel))
+        rnd = lambda v: None if v is None else round(v - t0, 3)
+        rows = []
+        for sid in sorted(set(segs) | set(self._seg_text)):
+            row = {"seg": sid, "text": self._seg_text.get(sid, ""),
+                   "commit": rnd(self._seg_commit.get(sid))}
+            items = sorted(segs.get(sid, []), key=lambda it: it[0]["i"])
+            if items:
+                (f, frel), (l, lrel) = items[0], items[-1]
+                row.update(words=f["n"], matched=len(items),
+                           spoken_start=rnd(f["s0"]), spoken_end=rnd(l["s1"]),
+                           heard_start=rnd(frel), heard_last_word=rnd(lrel))
+            rows.append(row)
+        return rows
 
     def segment_stats(self, short_words: int = 6) -> dict:
         """The two experiences a listener actually has.
@@ -506,7 +605,9 @@ class AccentConverter(StreamingConverter):
         self.words_spoken += len(words)
         self._unflushed += len(words)
         self._last_word_t = now
-        if self._unflushed >= self.flush_words or _PUNCT_END.search(words[-1]):
+        quick = (self.first_flush and not self._seg_flushed
+                 and self._unflushed >= self.first_flush)
+        if quick or self._unflushed >= self.flush_words or _PUNCT_END.search(words[-1]):
             await self._flush()
 
     async def _flush(self) -> None:
@@ -521,12 +622,36 @@ class AccentConverter(StreamingConverter):
                 return
         self._unflushed = 0
         self.flushes += 1
+        self._seg_flushed = True
+
+    async def _release_on_silence(self) -> None:
+        """Speak the held tail as soon as the speaker has gone quiet.
+
+        Checked on a timer, not only when a transcript update arrives:
+        Scribe often delivers the update containing the last word while it is
+        still being said, then sends nothing more until its end-of-speech
+        commit. Waiting for another update meant the last word -- and for a
+        one-word reply, the whole reply -- sat unspoken after the speaker
+        stopped.
+        """
+        if not (self.sos_s > 0 and self._hist and self._last_voice_t > 0):
+            return
+        if time.perf_counter() - self._last_voice_t < self.sos_s:
+            return
+        async with self._decide:
+            words = self._hist[-1] if self._hist else []
+            sent = len(self._seg_sent)
+            if len(words) > sent:
+                await self._speak(words[sent:])
+                self.silence_releases += 1
+                await self._flush()
 
     async def _idle_flusher(self) -> None:
         # A speaker pausing mid-thought should not leave words stuck in the
         # TTS buffer waiting for more characters.
         while not self._closing:
             await asyncio.sleep(0.05)
+            await self._release_on_silence()
             if self._unflushed and time.perf_counter() - self._last_word_t > self.idle_flush_s:
                 await self._flush()
 
@@ -539,6 +664,43 @@ class AccentConverter(StreamingConverter):
                         await self._tts.send(json.dumps({"text": " "}))
                     except Exception:
                         pass
+
+    async def _pinger(self) -> None:
+        while not self._closing:
+            await asyncio.sleep(self.ping_every_s)
+            for name, ws in (("stt", self._stt), ("tts", self._tts)):
+                ping = getattr(ws, "ping", None)
+                if ping is None:
+                    continue
+                try:
+                    t0 = time.perf_counter()
+                    waiter = await ping()
+                    await asyncio.wait_for(waiter, timeout=5.0)
+                    self._rtt[name].append((t0, time.perf_counter() - t0))
+                    if len(self._rtt[name]) > 4000:
+                        self._rtt[name] = self._rtt[name][-2000:]
+                except Exception:
+                    pass
+
+    @property
+    def net_now(self) -> dict:
+        """Latest round trip to each ElevenLabs connection, in ms."""
+        out = {}
+        for name, v in self._rtt.items():
+            if v:
+                out[f"{name}_rtt_ms"] = v[-1][1] * 1000.0
+        return out
+
+    def _rtt_near(self, t: float) -> float | None:
+        """Combined STT+TTS round trip measured closest to time t."""
+        tot = 0.0
+        for v in self._rtt.values():
+            if not v:
+                return None
+            ts = [a for a, _ in v]
+            i = min(range(len(ts)), key=lambda k: abs(ts[k] - t))
+            tot += v[i][1]
+        return tot
 
     def _upsample(self, x: np.ndarray) -> np.ndarray:
         """Continuous linear upsampling: carries one sample across chunks so
@@ -685,6 +847,22 @@ class AccentConverter(StreamingConverter):
             tail_ready = (0 < self._fifo_samples < self.block
                           and now - self._last_audio_t > 0.25)
             gap = self._next_release is None or self._next_release < now - self.block_s
+            if gap and self.pre_roll_s > 0 and self._fifo_samples > 0:
+                utterance_start = (not self._last_release_t
+                                   or now - self._last_release_t >= 1.0)
+                if utterance_start:
+                    if self._hold_until is None:
+                        self._hold_until = now + self.pre_roll_s
+                        self.pre_rolls += 1
+                    if now < self._hold_until:
+                        self._audio_evt.clear()
+                        try:
+                            await asyncio.wait_for(self._audio_evt.wait(),
+                                                   timeout=min(0.05, self._hold_until - now))
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+            self._hold_until = None
             need = max(self.block, self.cushion) if gap else self.block
             if self._fifo_samples >= need or tail_ready:
                 # Pace to real time. A gap in speech resets the clock so the
@@ -696,6 +874,7 @@ class AccentConverter(StreamingConverter):
                     await asyncio.sleep(wait)
                 pcm, piece = self._take(self.block)
                 self._next_release += self.block_s
+                self._last_release_t = time.perf_counter()
                 self.received += 1
                 c = AudioChunk(seq=self.received,
                                pcm=np.clip(pcm, -32768, 32767).astype(np.int16),
@@ -727,6 +906,33 @@ class AccentConverter(StreamingConverter):
     def connected(self) -> bool:
         return self._ready and not self._closing and not self._fatal
 
+    def _network_summary(self) -> dict:
+        """How much of the lag is the network, and does lag move with it?
+
+        Each word crosses the network twice: audio up to speech-to-text,
+        and text up / audio down for text-to-speech -- roughly one round trip
+        per leg. So the combined round trip approximates the network's share
+        of every word's lag.
+        """
+        out = {}
+        for name, v in self._rtt.items():
+            a = np.array([r for _, r in v]) * 1000.0
+            out[f"{name}_rtt_ms_median"] = float(np.median(a)) if a.size else None
+            out[f"{name}_rtt_ms_p95"] = float(np.percentile(a, 95)) if a.size else None
+            out[f"{name}_rtt_n"] = int(a.size)
+        pairs = []
+        for r, rel in self._resolved():
+            n = self._rtt_near(rel)
+            if n is not None:
+                pairs.append((rel - r["s1"], n))
+        corr = None
+        if len(pairs) >= 10:
+            l, n = np.array(pairs).T
+            if l.std() > 0 and n.std() > 0:
+                corr = float(np.corrcoef(l, n)[0, 1])
+        out["lag_vs_network_r"] = corr
+        return out
+
     def summary(self) -> dict:
         seg = self.segment_stats()
         lags = np.array(self.word_lags) * 1000.0
@@ -748,6 +954,14 @@ class AccentConverter(StreamingConverter):
             "long_start_ms": pct(np.array(seg["long_start"]) * 1000.0, 50),
             "long_n": len(seg["long_start"]),
             "drift_s_per_min": round(float(np.median(seg["drift"])), 2) if seg["drift"] else None,
+            "end_detect_ms": pct(np.array(self.end_detect) * 1000.0, 50),
+            "end_detect_p90_ms": pct(np.array(self.end_detect) * 1000.0, 90),
+            "end_detect_n": len(self.end_detect),
+            "pre_roll_ms": round(self.pre_roll_s * 1000.0),
+            "pre_rolls": self.pre_rolls,
+            "first_flush": self.first_flush,
+            "silence_releases": self.silence_releases,
+            **self._network_summary(),
             "tempo_on": self._tempo is not None,
             "tempo_rate_max": round(self.rate_max_seen, 3),
             "tempo_saved_s": round(self.tempo_saved_s, 2),

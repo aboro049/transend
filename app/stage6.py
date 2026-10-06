@@ -91,6 +91,14 @@ class Stage6Pipeline:
         self._last_retarget = 0.0
 
         self._recorder: wave.Wave_write | None = None
+        self._rec_last: float | None = None
+        # Session zero on the perf_counter clock -- the same clock every
+        # capture timestamp and the converter use -- so both recordings and
+        # the per-sentence log in --stats-json share one timeline.
+        self.t0: float | None = None
+        self._in_rec: wave.Wave_write | None = None
+        self._in_rec_lock = threading.Lock()
+        self._in_rec_started = False
         self._rec_lock = threading.Lock()
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -116,12 +124,32 @@ class Stage6Pipeline:
             except IndexError:
                 await asyncio.sleep(0.002)
                 continue
+            if self._in_rec is not None:
+                self._write_input(chunk)
             try:
                 await self.converter.send(chunk)
             except ConverterError as exc:
                 self.fatal = f"send failed: {exc}"
                 self._stop.set()
                 return
+
+    def _write_input(self, chunk) -> None:
+        """Save what the speaker actually said, on the session timeline.
+
+        Replaying this through each new setting (--source-file) compares
+        changes on identical speech -- live calls differ every time, and
+        near-identical settings measured up to 2x apart on different speech.
+        """
+        with self._in_rec_lock:
+            if self._in_rec is None:
+                return
+            if not self._in_rec_started and self.t0 is not None:
+                lead = chunk.t_capture - self.block / settings.SAMPLE_RATE - self.t0
+                if 0 < lead < 60:
+                    self._in_rec.writeframes(np.zeros(
+                        int(lead * settings.SAMPLE_RATE), np.int16).tobytes())
+                self._in_rec_started = True
+            self._in_rec.writeframes(chunk.pcm.astype(np.int16).tobytes())
 
     async def _receiver(self) -> None:
         a = 0.2
@@ -159,6 +187,30 @@ class Stage6Pipeline:
             self.fanout.push(chunk)
             if self.telemetry is not None:
                 self.telemetry.push_output(chunk.pcm)
+            if self._recorder and self.args.backend == "accent":
+                # Keep real time in the recording. Accent mode delivers speech
+                # in bursts with silence between, which the listener hears as
+                # pauses; writing chunks back-to-back erased those pauses, so
+                # a 96 s call produced a 30 s file with no gaps to inspect.
+                # Output is paced to real time, so arrival time is play time.
+                now = time.perf_counter()
+                if self._rec_last is None and self.t0 is not None:
+                    # lead-in silence, so second N of this file is second N of the call
+                    lead = now - self.t0
+                    if 0 < lead < 3600:
+                        with self._rec_lock:
+                            self._recorder.writeframes(np.zeros(
+                                int(lead * settings.SAMPLE_RATE), np.int16).tobytes())
+                if self._rec_last is not None:
+                    gap = now - self._rec_last - self.block / settings.SAMPLE_RATE
+                    # Cap generously: a 30 s cap silently dropped longer
+                    # silences, so a 266 s call produced a 98 s file and the
+                    # input and output recordings no longer lined up.
+                    if 0.02 < gap < 600:
+                        with self._rec_lock:
+                            self._recorder.writeframes(np.zeros(
+                                int(gap * settings.SAMPLE_RATE), np.int16).tobytes())
+                self._rec_last = now
             if self._recorder:
                 with self._rec_lock:
                     self._recorder.writeframes(chunk.pcm.tobytes())
@@ -182,6 +234,11 @@ class Stage6Pipeline:
             self._loop.close()
 
     def start(self, in_idx) -> None:
+        if getattr(self.args, "record_input", None):
+            self._in_rec = wave.open(self.args.record_input, "wb")
+            self._in_rec.setnchannels(1)
+            self._in_rec.setsampwidth(2)
+            self._in_rec.setframerate(settings.SAMPLE_RATE)
         if self.args.record:
             self._recorder = wave.open(self.args.record, "wb")
             self._recorder.setnchannels(1)
@@ -210,11 +267,19 @@ class Stage6Pipeline:
                 latency=_latency(self.args.latency),
                 callback=self._on_input,
             )
+        self.t0 = time.perf_counter()
         self.in_stream.start()
         self.started_at = time.monotonic()
 
     def stop(self) -> None:
         self._stop.set()
+        with self._in_rec_lock:
+            if self._in_rec is not None:
+                try:
+                    self._in_rec.close()
+                except Exception:
+                    pass
+                self._in_rec = None
         if self.in_stream:
             try:
                 self.in_stream.stop()
@@ -248,6 +313,7 @@ class Stage6Pipeline:
             "dropped": b.dropped if b else 0,
             "input_drops": self.in_dropped,
             "backlog_s": getattr(self.converter, "backlog_s", 0.0),
+            **getattr(self.converter, "net_now", {}),
         }
 
 
@@ -291,6 +357,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "percent faster, pitch-preserved. Stops drift on long speech.")
     a.add_argument("--tempo-max", type=float, default=1.08,
                    help="Fastest tempo allowed when catching up (1.08 = 8%%).")
+    a.add_argument("--first-flush", type=int, default=0,
+                   help="Quick start: flush after this many words at the start of "
+                        "each utterance, then natural boundaries. 0 = off.")
+    a.add_argument("--speak-on-silence", type=float, default=0.0,
+                   help="ms of mic silence after which the held last word is spoken "
+                        "at once -- speeds up short replies. 0 = off.")
+    a.add_argument("--pre-roll", type=float, default=0.0,
+                   help="ms to wait before the voice starts each utterance, so "
+                        "gaps later in it are covered. 0 = off.")
+    a.add_argument("--ping-every", type=float, default=2.0,
+                   help="Seconds between network round-trip samples. 0 = off.")
     a.add_argument("--cushion", type=float, default=0.0,
                    help="ms of audio held before resuming after a gap. Turns "
                         "many small stutters into fewer clean pauses.")
@@ -311,6 +388,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Log audio quality and network every second to a "
                         "JSONL file (default ~/.transend/sessions/). Analyse "
                         "with: python -m tools.timeline <file>")
+    p.add_argument("--record-input", default=None,
+                   help="Also save the raw microphone input to this WAV, aligned "
+                        "to the same timeline -- replay it later with --source-file.")
     p.add_argument("--stats-json", default=None,
                    help="Write the final run stats to this path as JSON, "
                         "so a parent process can record them.")
@@ -358,6 +438,10 @@ def main(argv: list[str] | None = None) -> int:
     # summary and the stats file are written, so every UI-run session loses
     # its counters -- which is exactly the data the history exists to keep.
     def _on_term(_sig, _frm):
+        # Ignore any further signal: the agent sends SIGTERM while a Ctrl+C
+        # shutdown may already be running, and a second interrupt landing
+        # inside cleanup aborted it before the summary was written.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, _on_term)
 
@@ -442,6 +526,8 @@ def main(argv: list[str] | None = None) -> int:
             max_pause_ms=args.max_pause, trim_above_s=args.trim_above,
             show_transcript=not args.quiet_transcript,
             tempo=args.tempo, tempo_max=args.tempo_max,
+            first_flush=args.first_flush, speak_on_silence_ms=args.speak_on_silence,
+            ping_every_s=args.ping_every, pre_roll_ms=args.pre_roll,
         )
     elif args.backend == "elevenlabs":
         if ElevenLabsConverter is None:
@@ -562,7 +648,10 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        pipe.stop()
+        try:
+            pipe.stop()
+        except BaseException as exc:             # cleanup must not lose the report
+            print(f"[WARN] shutdown: {exc}", file=sys.stderr)
 
     print("\n")
     print("=" * 62)
@@ -611,45 +700,74 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 62)
 
     if args.backend == "accent":
-        a = converter.summary()
+        a = converter.summary()  # .get(): tolerate older converters
         v0 = pipe.fanout.sinks[0].buffer if pipe.fanout.sinks else None
         extra = in_ms + (v0.target_ms if v0 else 0.0)
         print("  ---------------------------------------------------------- accent")
-        print(f"  words spoken     : {a['words_spoken']} in {a['segments']} segments, "
-              f"{a['flushes']} flushes")
-        print(f"  revised after    : {a['revisions_after_speaking']} "
+        print(f"  words spoken     : {a.get('words_spoken')} in {a.get('segments')} segments, "
+              f"{a.get('flushes')} flushes")
+        print(f"  revised after    : {a.get('revisions_after_speaking')} "
               f"(words spoken, then re-heard differently)")
-        if a["word_lag_samples"]:
-            print(f"  word lag         : median {a['word_lag_ms_median']:.0f} ms, "
-                  f"p95 {a['word_lag_ms_p95']:.0f} ms  ({a['word_lag_samples']} words, "
+        if a.get("word_lag_samples"):
+            print(f"  word lag         : median {(a.get('word_lag_ms_median') or 0):.0f} ms, "
+                  f"p95 {(a.get('word_lag_ms_p95') or 0):.0f} ms  ({a.get('word_lag_samples')} words, "
                   f"spoken -> handed to pipeline)")
-            print(f"    where it goes  : recognise {a['stage_asr_ms']:.0f} ms"
-                  f" -> hold {a['stage_hold_ms']:.0f} ms"
-                  f" -> TTS+queue {a['stage_tts_ms']:.0f} ms  (medians)")
-            print(f"  est. to far end  : ~{a['word_lag_ms_median'] + extra:.0f} ms "
+            print(f"    where it goes  : recognise {(a.get('stage_asr_ms') or 0):.0f} ms"
+                  f" -> hold {(a.get('stage_hold_ms') or 0):.0f} ms"
+                  f" -> TTS+queue {(a.get('stage_tts_ms') or 0):.0f} ms  (medians)")
+            print(f"  est. to far end  : ~{a.get('word_lag_ms_median') + extra:.0f} ms "
                   f"median  (+ buffer {extra:.0f} ms incl. input hw)")
         else:
             print("  word lag         : no timed words yet (needs completed segments)")
-        print(f"  TTS first audio  : {a['tts_first_audio_ms_median']:.0f} ms median")
-        print(f"  pauses trimmed   : {a['pause_trimmed_s']:.1f} s recovered from backlog")
-        if a["corrections_applied"]:
-            print(f"  corrections      : {a['corrections_applied']} words re-spelled for TTS")
+        print(f"  TTS first audio  : {(a.get('tts_first_audio_ms_median') or 0):.0f} ms median")
+        print(f"  pauses trimmed   : {(a.get('pause_trimmed_s') or 0):.1f} s recovered from backlog")
+        if a.get("corrections_applied"):
+            print(f"  corrections      : {a.get('corrections_applied')} words re-spelled for TTS")
         print("  ------------------------------------------------ what the listener feels")
-        if a["short_reply_n"]:
-            print(f"  short replies    : start heard {a['short_reply_ms']:.0f} ms after "
-                  f"speaker started  ({a['short_reply_n']} replies)")
-        if a["long_n"]:
-            print(f"  long speech      : start heard {a['long_start_ms']:.0f} ms after "
-                  f"speaker started  ({a['long_n']} utterances)")
-        if a["drift_s_per_min"] is not None:
-            print(f"  drift            : {a['drift_s_per_min']:+.2f} s per minute of "
+        if a.get("short_reply_n"):
+            print(f"  short replies    : start heard {(a.get('short_reply_ms') or 0):.0f} ms after "
+                  f"speaker started  ({a.get('short_reply_n')} replies)")
+        if a.get("long_n"):
+            print(f"  long speech      : start heard {(a.get('long_start_ms') or 0):.0f} ms after "
+                  f"speaker started  ({a.get('long_n')} utterances)")
+        if a.get("drift_s_per_min") is not None:
+            print(f"  drift            : {(a.get('drift_s_per_min') or 0):+.2f} s per minute of "
                   f"continuous speech  (0 = lag only at the start)")
-        if a["tempo_on"]:
-            print(f"  adaptive tempo   : up to {a['tempo_rate_max']:.3f}x, "
-                  f"recovered {a['tempo_saved_s']:.1f} s")
-        print(f"  backlog          : max {a['backlog_s_max']:.2f} s")
-        print(f"  backlog at end   : {a['backlog_s_end']:.2f} s "
-              f"{'<- growing: raise --tts-speed' if a['backlog_s_end'] > 1.5 else ''}")
+        if a.get("tempo_on"):
+            print(f"  adaptive tempo   : up to {(a.get('tempo_rate_max') or 0):.3f}x, "
+                  f"recovered {(a.get('tempo_saved_s') or 0):.1f} s")
+        if a.get("end_detect_n"):
+            print(f"  end of speech    : last word held {(a.get('end_detect_ms') or 0):.0f} ms after you stop "
+                  f"(p90 {(a.get('end_detect_p90_ms') or 0):.0f} ms, {a.get('end_detect_n')} sentences)")
+        if a.get("pre_rolls"):
+            print(f"  pre-roll         : {(a.get('pre_roll_ms') or 0):.0f} ms at the start of "
+                  f"{a.get('pre_rolls')} utterances")
+        if a.get("first_flush"):
+            print(f"  quick start      : first flush after {a.get('first_flush')} words")
+        if a.get("silence_releases"):
+            print(f"  speak on silence : {a.get('silence_releases')} last words released early")
+        print("  ------------------------------------------------------------ network")
+        for leg, label in (("stt", "speech-to-text"), ("tts", "text-to-speech")):
+            m = a.get(f"{leg}_rtt_ms_median")
+            if m is None:
+                print(f"  {label:<16} : no samples")
+            else:
+                print(f"  {label:<16} : round trip median {m:.0f} ms, "
+                      f"p95 {a[f'{leg}_rtt_ms_p95']:.0f} ms  ({a[f'{leg}_rtt_n']} samples)")
+        ms = a.get("stt_rtt_ms_median"); mt = a.get("tts_rtt_ms_median")
+        if ms is not None and mt is not None and a.get("word_lag_samples"):
+            share = ms + mt
+            print(f"  network share    : ~{share:.0f} ms of the {(a.get('word_lag_ms_median') or 0):.0f} ms "
+                  f"median lag ({share / max(a.get('word_lag_ms_median'), 1) * 100:.0f}%)")
+        r = a.get("lag_vs_network_r")
+        if r is not None:
+            verdict = ("lag rises with network delay" if r >= 0.3 else
+                       "weak link to network" if r >= 0.15 else
+                       "lag does not track network")
+            print(f"  lag vs network   : r = {r:+.2f}  ({verdict})")
+        print(f"  backlog          : max {(a.get('backlog_s_max') or 0):.2f} s")
+        print(f"  backlog at end   : {(a.get('backlog_s_end') or 0):.2f} s "
+              f"{'<- growing: raise --tts-speed' if a.get('backlog_s_end') > 1.5 else ''}")
     if pipe.telemetry is not None:
         v = pipe.fanout.sinks[0].buffer if pipe.fanout.sinks else None
         pipe.telemetry.stop(summary={
@@ -700,6 +818,10 @@ def main(argv: list[str] | None = None) -> int:
             v = pipe.fanout.sinks[0].buffer if pipe.fanout.sinks else None
             stats["total_ms"] = round(
                 in_ms + pipe.total_ms + (v.target_ms if v else 0.0), 1)
+            if args.backend == "accent":
+                stats["accent"] = converter.summary()
+                stats["t0"] = pipe.t0
+                stats["segments"] = converter.segment_table(pipe.t0 or 0.0)
             with open(args.stats_json, "w", encoding="utf-8") as f:
                 json.dump(stats, f, indent=2)
         except Exception as exc:  # noqa: BLE001
