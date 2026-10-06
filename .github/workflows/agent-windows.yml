@@ -1,0 +1,71 @@
+# Builds a single-file Windows executable of the agent.
+#
+# Why CI and not a local build: PyInstaller cannot cross-compile. A Windows
+# .exe has to be built on Windows, and the project is developed on a Mac.
+#
+# The point of the .exe is that a tester gets ONE file -- no Python, no
+# virtualenv, and no copy of the source.
+#
+# Download it from the run's Artifacts, or from the release if tagged.
+
+name: agent (windows)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "audio/**"
+      - "voice/**"
+      - "routing/**"
+      - "config/**"
+      - ".github/workflows/agent-windows.yml"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build
+        # --collect-all sounddevice bundles the PortAudio DLL, which is a data
+        # file rather than an import and is otherwise left out: the exe then
+        # builds cleanly and fails at startup on the user's machine.
+        run: |
+          pyinstaller --onefile --name transend-agent `
+            --collect-all sounddevice `
+            --collect-submodules websockets `
+            --console `
+            agent_main.py
+
+      - name: Smoke test
+        # Proves the exe starts and its dependencies loaded. It cannot test
+        # audio -- the runner has no sound devices.
+        run: |
+          .\dist\transend-agent.exe --help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: transend-agent-windows
+          path: dist/transend-agent.exe
+          retention-days: 30
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/transend-agent.exe
