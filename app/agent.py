@@ -50,6 +50,11 @@ from app.session import SessionManager, State, Voice, discover_voices
 from audio import devices as audio_devices
 from routing import virtual_audio
 
+# Stamped at build time by CI. A packaged build otherwise gives no way to
+# tell which code is inside it -- the option names live in compressed
+# bytecode, so even inspecting the file does not say.
+BUILD = os.getenv("TRANSEND_BUILD", "dev")
+
 TOKEN_FILE = Path(os.getenv("TRANSEND_HOME", Path.home() / ".transend")) / "agent-token"
 
 
@@ -274,7 +279,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, {"error": "origin not allowed"}, None)
         path = self.path.split("?")[0]
         if path == "/health":                      # no token: just "is it running"
-            return self._send(200, {"ok": True, "agent": "transend"}, origin)
+            return self._send(200, {"ok": True, "agent": "transend",
+                                    "build": BUILD}, origin)
         if not self._authed():
             return self._send(401, {"error": "bad or missing token"}, origin)
         if path == "/status":
@@ -364,7 +370,7 @@ def selftest() -> int:
     and lists the audio devices, so a tester gets one clear answer.
     """
     ok = True
-    print("TRANSEND agent self-test\n")
+    print(f"TRANSEND agent self-test   build {BUILD}\n")
     for mod, why in (("numpy", "audio maths"), ("sounddevice", "microphone"),
                      ("websockets", "talking to the GPU server")):
         try:
@@ -409,11 +415,19 @@ def main(argv=None) -> int:
                    help="seed-vc server address (wss://...). Overrides .env.")
     p.add_argument("--reference", default=None,
                    help="Voice reference WAV to convert to. Overrides voices/.")
+    p.add_argument("--runpod-key", default=None,
+                   help="RunPod API key, so this machine can start its own GPU "
+                        "in a datacentre near you. Otherwise pass --url.")
     p.add_argument("--selftest", action="store_true",
                    help="Check this build has everything it needs, then exit.")
     p.add_argument("--origin", action="append", default=[],
                    help="Web app origin allowed to drive this agent. Repeatable.")
     args = p.parse_args(argv)
+
+    if args.runpod_key:
+        # PodController reads this from the environment; setting it here means
+        # a packaged build needs no .env file beside it.
+        os.environ["RUNPOD_API_KEY"] = args.runpod_key
 
     if args.selftest:
         return selftest()
@@ -425,13 +439,18 @@ def main(argv=None) -> int:
     srv = ThreadingHTTPServer(("127.0.0.1", args.port),
                               partial(Handler, agent, token, origins))
     dev = agent.devices()
+    print(f"TRANSEND agent  build {BUILD}")
     print(f"agent listening on http://127.0.0.1:{args.port}")
     print(f"token: {token}")
     print(f"allowed origins: {', '.join(origins) if origins else 'ANY (no --origin given)'}")
     print(f"virtual device : {dev['virtual_device'] or 'NOT FOUND -- install BlackHole'}")
     print(f"microphone     : {agent.input_device}")
     print(f"voice          : {Path(agent.reference).name if agent.reference else (', '.join(dev['voices']) or 'NONE -- pass --reference')}")
-    print(f"server         : {agent.url or 'NOT SET -- pass --url'}")
+    if os.getenv("RUNPOD_API_KEY"):
+        from app.region import describe as region_describe
+        print(f"server         : will start its own GPU -- {region_describe()}")
+    else:
+        print(f"server         : {agent.url or 'NOT SET -- pass --url or --runpod-key'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

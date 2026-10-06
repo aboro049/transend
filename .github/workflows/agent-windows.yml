@@ -40,6 +40,21 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Stamp the build
+        # Written into the source before freezing, so the packaged agent can
+        # report which commit it came from.
+        shell: bash
+        run: |
+          short=${GITHUB_SHA::7}
+          python - "$short" <<'EOF'
+          import sys, pathlib
+          p = pathlib.Path("app/agent.py")
+          p.write_text(p.read_text().replace(
+              'BUILD = os.getenv("TRANSEND_BUILD", "dev")',
+              f'BUILD = os.getenv("TRANSEND_BUILD", "{sys.argv[1]}")'))
+          print("stamped", sys.argv[1])
+          EOF
+
       - name: Build
         # --collect-all sounddevice bundles the PortAudio DLL, which is a data
         # file rather than an import and is otherwise left out: the exe then
